@@ -362,6 +362,10 @@ func doReadlink(server *Server, req *request) {
 }
 
 func doLookup(server *Server, req *request) {
+	name := req.filenames[0]
+	if name == "." || name == ".." {
+		return
+	}
 	out := (*EntryOut)(req.outData())
 	s := server.fileSystem.Lookup(req.cancel, req.inHeader, req.filenames[0], out)
 	req.status = s
