@@ -50,6 +50,26 @@ func (fs *readFS) Read(ctx context.Context, input *ReadIn, buf []byte) (ReadResu
 	return ReadResultData(dest), OK
 }
 
+// GetAttr answers for the root and the file. FUSE-T's NFS mount fails
+// if GETATTR on the root returns ENOSYS, and FUSE-T treats inode 0 as
+// nonexistent, so Ino is set here and in Lookup.
+func (f *readFS) GetAttr(ctx context.Context, input *GetAttrIn, out *AttrOut) (code Status) {
+	switch input.NodeId {
+	case 1:
+		out.Ino = 1
+		out.Mode = S_IFDIR | 0755
+	case 2:
+		out.Ino = 2
+		out.Mode = S_IFREG | 0666
+		out.Size = 1 << 20
+	default:
+		return ENOENT
+	}
+	out.Nlink = 1
+	out.AttrValid = 1
+	return OK
+}
+
 func (f *readFS) Lookup(ctx context.Context, header *InHeader, name string, out *EntryOut) (code Status) {
 	if name != "file" {
 		return ENOENT
@@ -58,6 +78,7 @@ func (f *readFS) Lookup(ctx context.Context, header *InHeader, name string, out 
 	*out = EntryOut{
 		NodeId: 2,
 		Attr: Attr{
+			Ino:  2,
 			Mode: S_IFREG | 0666,
 			Size: 1 << 20,
 		},
