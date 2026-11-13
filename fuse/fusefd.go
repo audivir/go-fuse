@@ -134,8 +134,16 @@ func (r *fuseFD) withFD(f func(fd int)) error {
 func (r *fuseFD) writevFD(iov [][]byte) (int, error) {
 	var n int
 	var err error
+	if fuseTStream {
+		streamWriteMu.Lock()
+		defer streamWriteMu.Unlock()
+	}
 	if cerr := r.withFD(func(fd int) {
-		n, err = writev(fd, iov)
+		if fuseTStream {
+			n, err = writevFull(fd, iov)
+		} else {
+			n, err = writev(fd, iov)
+		}
 	}); cerr != nil {
 		return 0, cerr
 	}
@@ -163,6 +171,12 @@ func (c *fdCall) doRead(fd uintptr) {
 }
 
 func (c *fdCall) doWrite(fd uintptr) {
+	if fuseTStream {
+		streamWriteMu.Lock()
+		defer streamWriteMu.Unlock()
+		c.n, c.err = writevFull(int(fd), c.iov)
+		return
+	}
 	c.n, c.err = writev(int(fd), c.iov)
 }
 

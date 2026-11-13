@@ -111,7 +111,9 @@ type RenameIn struct {
 const compatRenameInSize = int(unsafe.Sizeof(InHeader{})) + 8
 
 func renameInSize(negotiated uint64) int {
-	if negotiated&CAP_RENAME_SWAP == 0 {
+	// FUSE-T advertises CAP_RENAME_SWAP but sends the compat
+	// 8-byte RENAME payload (no flags).
+	if fuseTStream || negotiated&CAP_RENAME_SWAP == 0 {
 		return compatRenameInSize
 	}
 	return int(unsafe.Sizeof(RenameIn{}))

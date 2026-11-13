@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 )
@@ -28,9 +29,127 @@ func unixgramSocketpair() (l, r *os.File, err error) {
 	return
 }
 
+// fuseTServerPath is the default location of the FUSE-T NFS server
+// binary. Like libfuse-t, it can be overridden with the
+// FUSE_NFSSRV_PATH environment variable.
+const fuseTServerPath = "/usr/local/bin/go-nfsv4"
+
+// fuseTMonitor is the local half of the FUSE-T monitor socket. It must
+// stay open for the lifetime of the mount: FUSE-T treats its closure as
+// a request to unmount.
+var fuseTMonitor *os.File
+
 // Create a FUSE FS on the specified mount point.  The returned
-// mount point is always absolute.
+// mount point is always absolute. FUSE-T is preferred when installed,
+// otherwise macFUSE/osxfuse is used.
 func mount(mountPoint string, opts *MountOptions, ready chan<- error) (fd int, err error) {
+	if bin, err := fuseTBinary(); err == nil {
+		fuseTStream = true
+		return mountFuseT(bin, mountPoint, opts, ready)
+	}
+	fuseTStream = false
+	return mountOSXFuse(mountPoint, opts, ready)
+}
+
+// mountFuseT mounts through FUSE-T. Unlike macFUSE, the FUSE protocol
+// is carried over a SOCK_STREAM socket shared with the go-nfsv4
+// server, so requests are length-prefixed rather than message-framed
+// (see readFrame).
+func mountFuseT(bin string, mountPoint string, opts *MountOptions, ready chan<- error) (fd int, err error) {
+	local, remote, err := unixgramSocketpair()
+	if err != nil {
+		return -1, err
+	}
+	defer local.Close()
+	defer remote.Close()
+
+	mon, remoteMon, err := unixgramSocketpair()
+	if err != nil {
+		return -1, err
+	}
+	defer remoteMon.Close()
+
+	args := []string{}
+	if opts.Debug {
+		args = append(args, "-d")
+	}
+	// FUSE-T uses the volume name as the NFS export path, so it must
+	// not contain slashes. Prefer an explicit volname= option (the
+	// macFUSE convention), else fall back to the base of FsName.
+	volname := ""
+	namedAttr := false
+	if opts.FsName != "" {
+		volname = filepath.Base(opts.FsName)
+	}
+	for _, o := range opts.optionsStrings() {
+		switch {
+		case o == "ro":
+			args = append(args, "-r")
+		case strings.HasPrefix(o, "volname="):
+			volname = strings.TrimPrefix(o, "volname=")
+		case o == "namedattr":
+			namedAttr = true
+		}
+	}
+	volname = strings.ReplaceAll(volname, "/", "_")
+	if volname != "" && volname != "." && volname != "_" {
+		args = append(args, "--volname", volname)
+	}
+	// Without named attributes, the NFS client stores xattrs as
+	// AppleDouble "._" files instead of issuing FUSE xattr calls. They
+	// are only enabled on request (like in libfuse-t), because every
+	// xattr operation then goes through short-lived attribute vnodes,
+	// which makes the macOS NFS client much more likely to panic
+	// ("nfs_vinvalbuf2: ubc_msync failed!, error 22", see fuse-t issue
+	// #109).
+	if namedAttr && !opts.DisableXAttrs {
+		args = append(args, "--namedattr=true")
+	}
+	args = append(args, fmt.Sprintf("--rwsize=%d", opts.MaxWrite), mountPoint)
+
+	cmd := exec.Command(bin, args...)
+	cmd.ExtraFiles = []*os.File{remote, remoteMon} // fd would be (index + 3)
+	cmd.Env = append(os.Environ(),
+		"_FUSE_COMMFD=3",
+		"_FUSE_MONFD=4",
+		"_FUSE_COMMVERS=2")
+
+	if err = cmd.Start(); err != nil {
+		mon.Close()
+		return -1, err
+	}
+	cmd.Process.Release()
+
+	// Hand an independent copy of the comm socket to the caller,
+	// which wraps it in its own *os.File (see newFuseFD).
+	fd, err = syscall.Dup(int(local.Fd()))
+	if err != nil {
+		mon.Close()
+		return -1, os.NewSyscallError("dup", err)
+	}
+	syscall.CloseOnExec(fd)
+	syscall.CloseOnExec(int(mon.Fd()))
+	fuseTMonitor = mon
+
+	go func() {
+		var err error
+		if _, werr := mon.Write([]byte("mount")); werr != nil {
+			err = fmt.Errorf("FUSE-T mount failed: %v", werr)
+		} else {
+			reply := make([]byte, 4)
+			if _, rerr := mon.Read(reply); rerr != nil {
+				err = fmt.Errorf("FUSE-T mount failed: %v", rerr)
+			}
+		}
+		ready <- err
+		close(ready)
+	}()
+
+	return fd, nil
+}
+
+// mountOSXFuse mounts through macFUSE/osxfuse.
+func mountOSXFuse(mountPoint string, opts *MountOptions, ready chan<- error) (fd int, err error) {
 	local, remote, err := unixgramSocketpair()
 	if err != nil {
 		return
@@ -111,4 +230,17 @@ func fusermountBinary() (string, error) {
 	}
 
 	return "", fmt.Errorf("no FUSE mount utility found")
+}
+
+// fuseTBinary returns the path of the FUSE-T NFS server, or an error
+// if FUSE-T is not installed.
+func fuseTBinary() (string, error) {
+	path := os.Getenv("FUSE_NFSSRV_PATH")
+	if path == "" {
+		path = fuseTServerPath
+	}
+	if _, err := os.Stat(path); err != nil {
+		return "", fmt.Errorf("FUSE-T not found: %v", err)
+	}
+	return path, nil
 }
